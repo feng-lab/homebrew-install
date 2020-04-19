@@ -158,6 +158,7 @@ should_install_git() {
 }
 
 should_install_command_line_tools() {
+  return 0
   if [[ -n "${HOMEBREW_ON_LINUX-}" ]]; then
     return 1
   fi

@@ -1,9 +1,9 @@
 # Homebrew (un)installer
 
-## Install Homebrew
+## Install Homebrew **without Installing Xcode Command Line Tools**
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/feng-lab/homebrew-install/master/install.sh)"
 ```
 
 More installation information and options at https://docs.brew.sh/Installation.html.
