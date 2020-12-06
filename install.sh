@@ -1,6 +1,12 @@
 #!/bin/bash
 set -u
 
+# Check if script is run non-interactively (e.g. CI)
+# If it is run non-interactively we should not prompt for passwords.
+if [[ ! -t 0 || -n "${CI-}" ]]; then
+  NONINTERACTIVE=1
+fi
+
 # First check if the OS is Linux.
 if [[ "$(uname)" = "Linux" ]]; then
   HOMEBREW_ON_LINUX=1
@@ -34,10 +40,14 @@ else
 fi
 BREW_REPO="https://github.com/Homebrew/brew"
 
+# TODO: bump version when new macOS is released or announced
+MACOS_NEWEST_UNSUPPORTED="12.0"
 # TODO: bump version when new macOS is released
-MACOS_LATEST_SUPPORTED="10.15"
-# TODO: bump version when new macOS is released
-MACOS_OLDEST_SUPPORTED="10.13"
+MACOS_OLDEST_SUPPORTED="10.14"
+
+# For Homebrew on Linux
+REQUIRED_RUBY_VERSION=2.6  # https://github.com/Homebrew/brew/pull/6556
+REQUIRED_GLIBC_VERSION=2.13  # https://docs.brew.sh/Homebrew-on-Linux#requirements
 
 # no analytics during installation
 export HOMEBREW_NO_ANALYTICS_THIS_RUN=1
@@ -57,13 +67,29 @@ tty_bold="$(tty_mkbold 39)"
 tty_reset="$(tty_escape 0)"
 
 have_sudo_access() {
+  local -a args
+  if [[ -n "${SUDO_ASKPASS-}" ]]; then
+    args=("-A")
+  elif [[ -n "${NONINTERACTIVE-}" ]]; then
+    args=("-n")
+  fi
+
   if [[ -z "${HAVE_SUDO_ACCESS-}" ]]; then
-    /usr/bin/sudo -l mkdir &>/dev/null
+    if [[ -n "${args[*]-}" ]]; then
+      SUDO="/usr/bin/sudo ${args[*]}"
+    else
+      SUDO="/usr/bin/sudo"
+    fi
+    if [[ -n "${NONINTERACTIVE-}" ]]; then
+      ${SUDO} -l mkdir &>/dev/null
+    else
+      ${SUDO} -v && ${SUDO} -l mkdir &>/dev/null
+    fi
     HAVE_SUDO_ACCESS="$?"
   fi
 
   if [[ -z "${HOMEBREW_ON_LINUX-}" ]] && [[ "$HAVE_SUDO_ACCESS" -ne 0 ]]; then
-    abort "Need sudo access on macOS!"
+    abort "Need sudo access on macOS (e.g. the user $USER to be an Administrator)!"
   fi
 
   return "$HAVE_SUDO_ACCESS"
@@ -104,10 +130,10 @@ execute() {
 
 execute_sudo() {
   local -a args=("$@")
-  if [[ -n "${SUDO_ASKPASS-}" ]]; then
-    args=("-A" "${args[@]}")
-  fi
   if have_sudo_access; then
+    if [[ -n "${SUDO_ASKPASS-}" ]]; then
+      args=("-A" "${args[@]}")
+    fi
     ohai "/usr/bin/sudo" "${args[@]}"
     execute "/usr/bin/sudo" "${args[@]}"
   else
@@ -153,12 +179,6 @@ version_lt() {
   [[ "${1%.*}" -lt "${2%.*}" ]] || [[ "${1%.*}" -eq "${2%.*}" && "${1#*.}" -lt "${2#*.}" ]]
 }
 
-should_install_git() {
-  if [[ $(command -v git) ]]; then
-    return 1
-  fi
-}
-
 should_install_command_line_tools() {
   return 0
   if [[ -n "${HOMEBREW_ON_LINUX-}" ]]; then
@@ -201,6 +221,49 @@ file_not_grpowned() {
   [[ " $(id -G "$USER") " != *" $(get_group "$1") "*  ]]
 }
 
+# Please sync with 'test_ruby()' in 'Library/Homebrew/utils/ruby.sh' from Homebrew/brew repository.
+test_ruby () {
+  if [[ ! -x $1 ]]
+  then
+    return 1
+  fi
+
+  "$1" --enable-frozen-string-literal --disable=gems,did_you_mean,rubyopt -rrubygems -e \
+    "abort if Gem::Version.new(RUBY_VERSION.to_s.dup).to_s.split('.').first(2) != \
+              Gem::Version.new('$REQUIRED_RUBY_VERSION').to_s.split('.').first(2)" 2>/dev/null
+}
+
+no_usable_ruby() {
+  local ruby_exec
+  IFS=$'\n' # Do word splitting on new lines only
+  for ruby_exec in $(which -a ruby); do
+    if test_ruby "$ruby_exec"; then
+      IFS=$' \t\n' # Restore IFS to its default value
+      return 1
+    fi
+  done
+  IFS=$' \t\n' # Restore IFS to its default value
+  return 0
+}
+
+outdated_glibc() {
+  local glibc_version
+  glibc_version=$(ldd --version | head -n1 | grep -o '[0-9.]*$' | grep -o '^[0-9]\+\.[0-9]\+')
+  version_lt "$glibc_version" "$REQUIRED_GLIBC_VERSION"
+}
+
+if [[ -n "${HOMEBREW_ON_LINUX-}" ]] && no_usable_ruby && outdated_glibc
+then
+    abort "$(cat <<-EOFABORT
+	Homebrew requires Ruby $REQUIRED_RUBY_VERSION which was not found on your system.
+	Homebrew portable Ruby requires Glibc version $REQUIRED_GLIBC_VERSION or newer,
+	and your Glibc version is too old.
+	See ${tty_underline}https://docs.brew.sh/Homebrew-on-Linux#requirements${tty_reset}
+	Install Ruby $REQUIRED_RUBY_VERSION and add its location to your PATH.
+	EOFABORT
+    )"
+fi
+
 # USER isn't always set so provide a fall back for the installer and subprocesses.
 if [[ -z "${USER-}" ]]; then
   USER="$(chomp "$(id -un)")"
@@ -217,7 +280,7 @@ fi
 cd "/usr" || exit 1
 
 ####################################################################### script
-if should_install_git; then
+if ! command -v git >/dev/null; then
     abort "$(cat <<EOABORT
 You must install Git before installing Homebrew. See:
   ${tty_underline}https://docs.brew.sh/Installation${tty_reset}
@@ -225,14 +288,25 @@ EOABORT
 )"
 fi
 
-if [[ -n "${HOMEBREW_ON_LINUX-}" ]]; then
-  if [[ -n "${CI-}" ]] || [[ -w "$HOMEBREW_PREFIX_DEFAULT" ]] || [[ -w "/home/linuxbrew" ]] || [[ -w "/home" ]]; then
+if ! command -v curl >/dev/null; then
+    abort "$(cat <<EOABORT
+You must install cURL before installing Homebrew. See:
+  ${tty_underline}https://docs.brew.sh/Installation${tty_reset}
+EOABORT
+)"
+fi
+
+if [[ -z "${HOMEBREW_ON_LINUX-}" ]]; then
+ have_sudo_access
+else
+  if [[ -n "${NONINTERACTIVE-}" ]] ||
+     [[ -w "$HOMEBREW_PREFIX_DEFAULT" ]] ||
+     [[ -w "/home/linuxbrew" ]] ||
+     [[ -w "/home" ]]; then
     HOMEBREW_PREFIX="$HOMEBREW_PREFIX_DEFAULT"
   else
     trap exit SIGINT
-    sudo_output="$(/usr/bin/sudo -n -l mkdir 2>&1)"
-    sudo_exit_code="$?"
-    if [[ "$sudo_exit_code" -ne 0 ]] && [[ "$sudo_output" = "sudo: a password is required" ]]; then
+    if ! /usr/bin/sudo -n -v &>/dev/null; then
       ohai "Select the Homebrew installation directory"
       echo "- ${tty_bold}Enter your password${tty_reset} to install to ${tty_underline}${HOMEBREW_PREFIX_DEFAULT}${tty_reset} (${tty_bold}recommended${tty_reset})"
       echo "- ${tty_bold}Press Control-D${tty_reset} to install to ${tty_underline}$HOME/.linuxbrew${tty_reset}"
@@ -248,16 +322,33 @@ if [[ -n "${HOMEBREW_ON_LINUX-}" ]]; then
   HOMEBREW_REPOSITORY="${HOMEBREW_PREFIX}/Homebrew"
 fi
 
-if [[ "$UID" == "0" ]]; then
+if [[ "${EUID:-${UID}}" == "0" ]]; then
   abort "Don't run this as root!"
 elif [[ -d "$HOMEBREW_PREFIX" && ! -x "$HOMEBREW_PREFIX" ]]; then
   abort "$(cat <<EOABORT
-The Homebrew prefix, ${HOMEBREW_PREFIX}, exists but is not searchable. If this is
-not intentional, please restore the default permissions and try running the
-installer again:
+The Homebrew prefix, ${HOMEBREW_PREFIX}, exists but is not searchable.
+If this is not intentional, please restore the default permissions and
+try running the installer again:
     sudo chmod 775 ${HOMEBREW_PREFIX}
 EOABORT
 )"
+fi
+
+UNAME_MACHINE="$(uname -m)"
+
+if [[ -z "${HOMEBREW_ON_LINUX-}" ]] && [[ "$UNAME_MACHINE" == "arm64" ]]; then
+  abort "$(cat <<EOABORT
+Homebrew is not (yet) supported on ARM processors!
+Rerun the Homebrew installer under Rosetta 2.
+If you really know what you are doing and are prepared for a very broken
+experience you can use another installation option for installing on ARM:
+  ${tty_underline}https://docs.brew.sh/Installation${tty_reset}
+EOABORT
+)"
+fi
+
+if [[ "$UNAME_MACHINE" != "x86_64" ]]; then
+  abort "Homebrew is only supported on Intel processors!"
 fi
 
 if [[ -z "${HOMEBREW_ON_LINUX-}" ]]; then
@@ -267,15 +358,13 @@ Your Mac OS X version is too old. See:
   ${tty_underline}https://github.com/mistydemeo/tigerbrew${tty_reset}
 EOABORT
 )"
-  elif version_lt "$macos_version" "10.9"; then
+  elif version_lt "$macos_version" "10.10"; then
     abort "Your OS X version is too old"
-  elif ! [[ "$(dsmemberutil checkmembership -U "$USER" -G "$GROUP")" = *"user is a member"* ]]; then
-    abort "This script requires the user $USER to be an Administrator."
-  elif version_gt "$macos_version" "$MACOS_LATEST_SUPPORTED" || \
+  elif version_ge "$macos_version" "$MACOS_NEWEST_UNSUPPORTED" || \
     version_lt "$macos_version" "$MACOS_OLDEST_SUPPORTED"; then
     who="We"
     what=""
-    if version_gt "$macos_version" "$MACOS_LATEST_SUPPORTED"; then
+    if version_ge "$macos_version" "$MACOS_NEWEST_UNSUPPORTED"; then
       what="pre-release version"
     else
       who+=" (and Apple)"
@@ -394,7 +483,7 @@ if should_install_command_line_tools; then
   ohai "The Xcode Command Line Tools will be installed."
 fi
 
-if [[ -t 0 && -z "${CI-}" ]]; then
+if [[ -z "${NONINTERACTIVE-}" ]]; then
   wait_for_user
 fi
 
@@ -513,7 +602,7 @@ ohai "Downloading and installing Homebrew..."
   execute "ln" "-sf" "${HOMEBREW_REPOSITORY}/bin/brew" "${HOMEBREW_PREFIX}/bin/brew"
 
   execute "${HOMEBREW_PREFIX}/bin/brew" "update" "--force"
-)
+) || exit 1
 
 if [[ ":${PATH}:" != *":${HOMEBREW_PREFIX}/bin:"* ]]; then
   warn "${HOMEBREW_PREFIX}/bin is not in your PATH."
@@ -548,7 +637,7 @@ EOS
   cd "${HOMEBREW_REPOSITORY}" >/dev/null || return
   execute "git" "config" "--replace-all" "homebrew.analyticsmessage" "true"
   execute "git" "config" "--replace-all" "homebrew.caskanalyticsmessage" "true"
-)
+) || exit 1
 
 ohai "Next steps:"
 echo "- Run \`brew help\` to get started"
@@ -572,18 +661,24 @@ if [[ -n "${HOMEBREW_ON_LINUX-}" ]]; then
       ;;
   esac
 
+  echo "- Install the Homebrew dependencies if you have sudo access:"
+
+  if [[ $(command -v apt-get) ]]; then
+    echo "    sudo apt-get install build-essential"
+  elif [[ $(command -v yum) ]]; then
+    echo "    sudo yum groupinstall 'Development Tools'"
+  elif [[ $(command -v pacman) ]]; then
+    echo "    sudo pacman -S base-devel"
+  elif [[ $(command -v apk) ]]; then
+    echo "    sudo apk add build-base"
+  fi
+
   cat <<EOS
-- Install the Homebrew dependencies if you have sudo access:
-  ${tty_bold}Debian, Ubuntu, etc.${tty_reset}
-    sudo apt-get install build-essential
-  ${tty_bold}Fedora, Red Hat, CentOS, etc.${tty_reset}
-    sudo yum groupinstall 'Development Tools'
-  See ${tty_underline}https://docs.brew.sh/linux${tty_reset} for more information.
-- Configure Homebrew in your ${tty_underline}${shell_profile}${tty_reset} by running
+    See ${tty_underline}https://docs.brew.sh/linux${tty_reset} for more information
+- Add Homebrew to your ${tty_bold}PATH${tty_reset} in ${tty_underline}${shell_profile}${tty_reset}:
     echo 'eval \$(${HOMEBREW_PREFIX}/bin/brew shellenv)' >> ${shell_profile}
-- Add Homebrew to your ${tty_bold}PATH${tty_reset}
     eval \$(${HOMEBREW_PREFIX}/bin/brew shellenv)
-- We recommend that you install GCC by running:
+- We recommend that you install GCC:
     brew install gcc
 
 EOS

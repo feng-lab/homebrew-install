@@ -1,16 +1,14 @@
 # Homebrew (un)installer
 
-## Install Homebrew **without Installing Xcode Command Line Tools**
+## Install Homebrew (on macOS or Linux) **without Installing Xcode Command Line Tools**
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/feng-lab/homebrew-install/feng/install.sh)"
 ```
 
-More installation information and options at https://docs.brew.sh/Installation.html.
+More installation information and options: https://docs.brew.sh/Installation.
 
-### Linux and Windows 10 Subsystem for Linux
-
-Install Homebrew on Linux and Windows 10 Subsystem for Linux: https://docs.brew.sh/Linuxbrew.
+If running Linux or WSL, [there are some pre-requisite packages to install](https://docs.brew.sh/Homebrew-on-Linux#requirements).
 
 ## Uninstall Homebrew
 
